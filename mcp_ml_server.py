@@ -1,15 +1,8 @@
-# mcp_ml_server.py
-"""
-MCP server that exposes the ML pipeline (ml_pipeline.py) as tools.
+"""MCP server exposing the ML pipeline as tools.
 
-Run it with:
-    uv run python mcp_ml_server.py
-
-It speaks MCP over stdin/stdout, so it prints nothing and waits for a client
-(mcp_client_demo.py, Claude Desktop, VS Code, etc.). Every tool call is
-recorded in the Parquet audit log (parquet_store.py).
-
-Never print() to stdout in this file: stdout carries the MCP protocol.
+Run via: uv run python mcp_ml_server.py
+The server communicates over stdin/stdout; do not print to stdout.
+Tool calls are recorded in the Parquet audit log.
 """
 from __future__ import annotations
 
@@ -19,22 +12,17 @@ from typing import Any, Callable, Dict, Optional
 
 from pydantic import Field
 
-# The high-level server class is called MCPServer in MCP Python SDK 2.x and
-# FastMCP in 1.x. They share the same decorator API, so support both.
 try:
     from mcp.server.mcpserver import MCPServer as _Server
-except ImportError:  # MCP Python SDK 1.x
+except ImportError:
     from mcp.server.fastmcp import FastMCP as _Server
 
 from parquet_store import append_audit_row, export_audit_copy
 import ml_pipeline as ml
 
-
 server = _Server("mcp-ml-agent")
-
 DEFAULT_RULE = "recall_then_precision_then_accuracy"
 
-# Shared argument definitions (shown to the client as the tool's input schema)
 TestSize = Field(default=0.2, gt=0, lt=1, description="Fraction of the data held out for testing.")
 RandomState = Field(default=42, description="Random seed for the train/test split.")
 KnnNeighbors = Field(default=5, ge=1, description="Number of neighbors for the KNN model.")
@@ -42,22 +30,16 @@ RequestId = Field(default="unknown", description="Your own id for this call; rec
 
 
 def _log(row: Dict[str, Any]) -> None:
-    """Write an audit row without ever letting a logging failure break a tool."""
+    """Write an audit row without letting logging failures break a tool."""
     try:
         append_audit_row(row)
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         print(f"[mcp-ml-agent] audit log write failed: {e}", file=sys.stderr)
 
 
 def _run(tool: str, request_id: str, work: Callable[[], Dict[str, Any]],
          audit: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """
-    Run a tool body, log it, and return its result.
-
-    On success, logs request_id, tool, status and any extra fields from
-    `audit(result)`. On failure, logs the error and returns
-    {"status": "error", "message": ...} instead of crashing the server.
-    """
+    """Execute, audit and return a tool result, converting exceptions to error results."""
     try:
         result = work()
     except Exception as e:
@@ -81,10 +63,6 @@ def _metrics(e: ml.EvalResult) -> Dict[str, Any]:
     }
 
 
-# ---------------------------------------------------------------------------
-# Tools
-# ---------------------------------------------------------------------------
-
 @server.tool()
 def train_models(
     test_size: float = TestSize,
@@ -106,10 +84,7 @@ def get_sample_input(
     random_state: int = RandomState,
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """
-    Return one test-set patient as a ready-to-use `input_data` dictionary for
-    the predict tools, along with that patient's true diagnosis.
-    """
+    """Return a test patient as an input_data dictionary and its true diagnosis."""
     def work():
         sample = ml.get_sample_input(index, test_size, random_state)
         return {"status": "success", **sample}
@@ -170,10 +145,10 @@ def confusion_matrix_metrics(
     knn_neighbors: int = KnnNeighbors,
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """
-    Compute the confusion matrix plus accuracy/precision/recall for both models
-    on the test set. Precision and recall are for the malignant class.
-    Confusion matrix order is [malignant, benign]; rows = actual, columns = predicted.
+    """Compute confusion matrix, accuracy, precision and recall for both models on the test set.
+
+    Precision and recall are for the malignant class. Confusion matrix order is
+    [malignant, benign]; rows are actual, columns are predicted.
     """
     def work():
         ds, lr, knn, source = ml.get_trained_models(test_size, random_state, knn_neighbors)
@@ -232,9 +207,9 @@ def shap_explain_selected(
     selection_rule: str = Field(default=DEFAULT_RULE, description="Rule used to pick the model to explain."),
     request_id: str = RequestId,
 ) -> Dict[str, Any]:
-    """
-    Run SHAP for the selected model: global top features plus a local
-    explanation for one test row. Positive SHAP values push toward malignant.
+    """Run SHAP for the selected model: global features and one local explanation.
+
+    Positive SHAP values push toward malignant.
     """
     def work():
         ds, model, selection, source = _select(test_size, random_state, knn_neighbors, selection_rule)
@@ -267,6 +242,22 @@ def export_parquet_audit(
         lambda r: {"export_path": r["parquet_path"]},
     )
 
+
+@server.tool()
+def predict_both(
+    input_data: Dict[str, Any] = Field(description=INPUT_DATA_DESCRIPTION),
+    request_id: str = RequestId,
+) -> Dict[str, Any]:
+    """Predict with BOTH models in one call and report whether they agree."""
+    def work():
+        lr = ml.predict_with_model(ml.load_model("logistic_regression"), input_data)
+        knn = ml.predict_with_model(ml.load_model("knn"), input_data)
+        return {"status": "success",
+                "logistic_regression": lr["predicted_class"],
+                "knn": knn["predicted_class"],
+                "models_agree": lr["predicted_class"] == knn["predicted_class"]}
+    return _run("predict_both", request_id, work,
+                lambda r: {"models_agree": r["models_agree"]})
 
 if __name__ == "__main__":
     server.run("stdio")
